@@ -1,0 +1,107 @@
+{
+  "name": "java-interface-impl-jumper",
+  "displayName": "Java Interface Implementation Jumper",
+  "description": "Jump between Java interfaces and their implementations with ease",
+  "version": "1.3.0",
+  "publisher": "Intelligent-GuoXin",
+  "author": {
+    "name": "GuoXin"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Intelligent-GuoXin/java-interface-impl-jumper"
+  },
+  "engines": {
+    "vscode": "^1.60.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Other"
+  ],
+  "keywords": [
+    "java",
+    "interface",
+    "implementation",
+    "navigation",
+    "jump"
+  ],
+  "icon": "images/icon.png",
+  "galleryBanner": {
+    "color": "#C80000",
+    "theme": "dark"
+  },
+  "activationEvents": [
+    "onLanguage:java",
+    "workspaceContains:*.java"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "java-interface-impl-jumper.jumpToImplementationFromMethod",
+        "title": "Jump to Implementation"
+      },
+      {
+        "command": "java-interface-impl-jumper.jumpToInterfaceFromMethod",
+        "title": "Jump to Interface"
+      },
+      {
+        "command": "java-interface-impl-jumper.findMethodReferences",
+        "title": "Find Method References"
+      },
+      {
+        "command": "java-interface-impl-jumper.jumpToImplementationFromAbstractClass",
+        "title": "Jump to Abstract Class Implementation"
+      },
+      {
+        "command": "java-interface-impl-jumper.jumpToImplementationFromInterface",
+        "title": "Jump to Interface Implementation"
+      }
+    ],
+    "configuration": {
+      "title": "Java Interface Implementation Jumper",
+      "properties": {
+        "javaInterfaceImplJumper.enableCodeLens": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable CodeLens for jumping between interfaces and implementations"
+        },
+        "javaInterfaceImplJumper.enableFindReferences": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable or disable the 'Find References' functionality"
+        },
+        "javaInterfaceImplJumper.excludeFolders": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": ["node_modules", ".history"],
+          "description": "Folders to exclude when searching for Java files (e.g. node_modules, .history, build, target)"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src --ext ts",
+    "test": "node ./out/test/runTest.js"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.60.0",
+    "@types/glob": "^7.1.3",
+    "@types/mocha": "^8.2.2",
+    "@types/node": "14.x",
+    "eslint": "^7.27.0",
+    "@typescript-eslint/eslint-plugin": "^4.26.0",
+    "@typescript-eslint/parser": "^4.26.0",
+    "glob": "^7.1.7",
+    "mocha": "^8.4.0",
+    "typescript": "^4.3.2",
+    "vscode-test": "^1.5.2"
+  }
+}
