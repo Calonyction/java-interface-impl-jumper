@@ -74,6 +74,47 @@ const interfaceImplCache = new LRUCache<string, string[]>(500);
 const implInterfaceCache = new LRUCache<string, string[]>(500);
 const methodLocationCache = new LRUCache<string, { line: number; column: number }>(200);
 const interfaceFilesCache = new LRUCache<string, string[]>(500);
+const lombokFieldCache = new LRUCache<string, { version: number; fields: JavaFieldInfo[] }>(200);
+const referenceAccessTypeCache = new LRUCache<string, FieldAccessType | 'reference'>(1000);
+
+type FieldAccessType = 'read' | 'write';
+
+interface LombokAccessorConfig {
+    hasGetter: boolean;
+    hasSetter: boolean;
+    customAccessorNaming: boolean;
+}
+
+interface JavaFieldInfo {
+    name: string;
+    type: string;
+    line: number;
+    column: number;
+    ownerClassName: string | null;
+    hasGetter: boolean;
+    hasSetter: boolean;
+    getterNames: string[];
+    setterNames: string[];
+}
+
+interface FieldReferenceSearchOptions {
+    includeReads: boolean;
+    includeWrites: boolean;
+    includeDeclaration: boolean;
+}
+
+type ReferenceTreeItemKind = 'root' | 'file' | 'reference';
+
+interface ReferenceTreeNode {
+    kind: ReferenceTreeItemKind;
+    label: string;
+    location?: vscode.Location;
+    children?: ReferenceTreeNode[];
+    accessType?: FieldAccessType | 'reference';
+    detail?: string;
+    hitText?: string;
+    highlightRange?: [number, number];
+}
 
 function invalidateCachesForFile(filePath: string): void {
     const baseName = path.basename(filePath, '.java');
@@ -81,6 +122,7 @@ function invalidateCachesForFile(filePath: string): void {
     implInterfaceCache.delete(baseName);
     interfaceFilesCache.deleteWhere(() => true);
     methodLocationCache.deleteWhere(k => k.includes(filePath));
+    lombokFieldCache.delete(filePath);
     log(LogLevel.Debug, `Cache invalidated for: ${baseName}`);
 }
 
@@ -89,6 +131,8 @@ function clearAllCaches(): void {
     implInterfaceCache.clear();
     methodLocationCache.clear();
     interfaceFilesCache.clear();
+    lombokFieldCache.clear();
+    referenceAccessTypeCache.clear();
     log(LogLevel.Debug, 'All caches cleared');
 }
 
@@ -330,6 +374,324 @@ function getClassNameFromContent(content: string): string | null {
     return m?.[1] ?? null;
 }
 
+/** 获取 Java package 名称 */
+function getPackageNameFromContent(content: string): string | null {
+    const match = content.match(/^\s*package\s+([\w.]+)\s*;/m);
+    return match?.[1] ?? null;
+}
+
+/** 获取指定行所在的方法名 */
+function getEnclosingMethodName(document: vscode.TextDocument, lineNumber: number): string | null {
+    let braceDepth = 0;
+    let inBlockComment = false;
+    let currentMethod: { name: string; depth: number } | null = null;
+
+    for (let i = 0; i <= lineNumber; i++) {
+        const rawLine = document.lineAt(i).text;
+        const bc = processBlockComments(rawLine, inBlockComment);
+        inBlockComment = bc.inBlockComment;
+        const cleanedLine = bc.text;
+        const trimmed = stripLine(cleanedLine).trim();
+        const depthBefore = braceDepth;
+
+        if (depthBefore === 1 && looksLikeMethodDeclaration(trimmed)) {
+            const methodName = extractMethodName(trimmed);
+            if (methodName && !isConstructor(methodName, document.getText())) {
+                currentMethod = { name: methodName, depth: depthBefore };
+            }
+        }
+
+        const braces = countBraces(cleanedLine);
+        braceDepth += braces.open - braces.close;
+
+        if (currentMethod && braceDepth <= currentMethod.depth && i < lineNumber) {
+            currentMethod = null;
+        }
+    }
+
+    return currentMethod?.name ?? null;
+}
+
+/** 构建 Java 语义引用 */
+function buildJavaReference(document: vscode.TextDocument, position: vscode.Position): string | null {
+    const content = document.getText();
+    const className = getClassNameFromContent(content);
+    if (!className) { return null; }
+
+    const packageName = getPackageNameFromContent(content);
+    const qualifiedClassName = packageName ? `${packageName}.${className}` : className;
+    const methodName = getEnclosingMethodName(document, position.line);
+    const lineNumber = position.line + 1;
+
+    return methodName
+        ? `${qualifiedClassName}#${methodName}:${lineNumber}`
+        : `${qualifiedClassName}:${lineNumber}`;
+}
+
+/** 构建通用文件引用 */
+function buildFileReference(document: vscode.TextDocument, position: vscode.Position): string {
+    const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
+    const filePath = workspaceFolder
+        ? path.relative(workspaceFolder.uri.fsPath, document.uri.fsPath)
+        : document.uri.fsPath;
+    return `${filePath}:${position.line + 1}`;
+}
+
+/** 构建类似 IDEA Copy Reference 的字符串 */
+function buildCopyReference(document: vscode.TextDocument, position: vscode.Position): string {
+    if (document.languageId === 'java') {
+        return buildJavaReference(document, position) || buildFileReference(document, position);
+    }
+
+    return buildFileReference(document, position);
+}
+
+/** 计算方法引用搜索时可接受的 owner 名称 */
+function getReferenceOwnerNames(content: string): string[] {
+    const ownerNames = new Set<string>();
+    const className = getClassNameFromContent(content);
+    if (className) { ownerNames.add(className); }
+
+    for (const iface of getImplementedInterfaces(content)) {
+        if (!iface.startsWith('__extends:')) {
+            ownerNames.add(iface);
+        }
+    }
+
+    return [...ownerNames];
+}
+
+/** 判断 @Accessors 是否改变 JavaBean 方法命名 */
+function hasCustomAccessorsNaming(content: string): boolean {
+    const accessorsMatches = content.match(/@Accessors\s*\(([^)]*)\)/g) ?? [];
+    return accessorsMatches.some(annotation => {
+        const params = annotation.substring(annotation.indexOf('(') + 1, annotation.lastIndexOf(')'));
+        return /\bfluent\s*=\s*true\b/.test(params) || /\bprefix\s*=/.test(params);
+    });
+}
+
+/** 判断当前文件是否使用 Lombok 生成访问器 */
+function getLombokAccessorConfig(content: string): LombokAccessorConfig {
+    const customAccessorNaming = hasCustomAccessorsNaming(content);
+    const hasData = /@Data\b/.test(content);
+    const hasGetter = hasData || /@Getter\b/.test(content);
+    const hasSetter = hasData || /@Setter\b/.test(content);
+
+    return {
+        hasGetter,
+        hasSetter,
+        customAccessorNaming
+    };
+}
+
+/** 按 Lombok 规则生成访问器后缀 */
+function toAccessorSuffix(fieldName: string): string {
+    if (fieldName.length === 0) { return fieldName; }
+    if (fieldName.length > 1 && /[A-Z]/.test(fieldName[1])) {
+        return fieldName;
+    }
+    return fieldName.charAt(0).toUpperCase() + fieldName.slice(1);
+}
+
+/** 生成 Lombok 字段可能对应的 getter 名称 */
+function buildGetterNames(fieldName: string, fieldType: string): string[] {
+    const suffix = toAccessorSuffix(fieldName);
+    const names = new Set<string>();
+    const normalizedType = fieldType.replace(/\s+/g, '');
+    const isBoolean = normalizedType === 'boolean' || normalizedType === 'Boolean';
+
+    names.add(`get${suffix}`);
+    if (isBoolean) {
+        names.add(`is${suffix}`);
+        if (fieldName.startsWith('is') && fieldName.length > 2 && /[A-Z]/.test(fieldName[2])) {
+            names.add(fieldName);
+            names.add(`get${fieldName.charAt(0).toUpperCase()}${fieldName.slice(1)}`);
+        }
+    }
+
+    return [...names];
+}
+
+/** 生成 Lombok 字段可能对应的 setter 名称 */
+function buildSetterNames(fieldName: string): string[] {
+    return [`set${toAccessorSuffix(fieldName)}`];
+}
+
+/** 判断当前行是否像字段声明 */
+function looksLikeFieldDeclaration(text: string): boolean {
+    if (!text.endsWith(';') || text.includes('(') || text.includes(')')) { return false; }
+    if (text.startsWith('return ') || text.startsWith('throw ')) { return false; }
+    if (/\b(class|interface|enum|record)\b/.test(text)) { return false; }
+    return /\b(private|protected|public)\b/.test(text);
+}
+
+/** 移除行内注解，降低字段解析复杂度 */
+function stripInlineAnnotations(text: string): string {
+    return text.replace(/@\w+(?:\([^)]*\))?\s*/g, '');
+}
+
+/** 解析 Java 字段声明行 */
+function parseFieldDeclarationLine(text: string): { type: string; name: string } | null {
+    const cleaned = stripInlineAnnotations(text)
+        .replace(/\b(private|protected|public|static|final|transient|volatile)\b/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    if (!cleaned.endsWith(';')) { return null; }
+
+    const withoutInitializer = cleaned.slice(0, -1).split('=')[0]?.trim();
+    if (!withoutInitializer) { return null; }
+
+    const match = withoutInitializer.match(/^(.+?)\s+([A-Za-z_]\w*)$/);
+    if (!match) { return null; }
+
+    return {
+        type: match[1].trim(),
+        name: match[2].trim()
+    };
+}
+
+/** 解析 Lombok 类中的字段 */
+function parseLombokFields(document: vscode.TextDocument): JavaFieldInfo[] {
+    const filePath = document.uri.fsPath;
+    const cached = lombokFieldCache.get(filePath);
+    if (cached?.version === document.version) { return cached.fields; }
+
+    const content = document.getText();
+    const accessorConfig = getLombokAccessorConfig(content);
+    if ((!accessorConfig.hasGetter && !accessorConfig.hasSetter) || accessorConfig.customAccessorNaming) {
+        lombokFieldCache.set(filePath, { version: document.version, fields: [] });
+        return [];
+    }
+
+    const ownerClassName = getClassNameFromContent(content);
+    const fields: JavaFieldInfo[] = [];
+    let braceDepth = 0;
+    let inBlockComment = false;
+
+    for (let i = 0; i < document.lineCount; i++) {
+        const rawLine = document.lineAt(i).text;
+        const bc = processBlockComments(rawLine, inBlockComment);
+        inBlockComment = bc.inBlockComment;
+        const cleanedLine = bc.text;
+        const braces = countBraces(cleanedLine);
+        const depthBefore = braceDepth;
+        braceDepth += braces.open - braces.close;
+
+        if (depthBefore !== 1) { continue; }
+
+        const trimmed = stripLine(cleanedLine).trim();
+        if (!trimmed || trimmed.startsWith('//') || trimmed.startsWith('*')) {
+            continue;
+        }
+        if (trimmed.startsWith('@') && !trimmed.includes(';')) { continue; }
+        if (!looksLikeFieldDeclaration(trimmed)) { continue; }
+
+        const parsed = parseFieldDeclarationLine(trimmed);
+        if (!parsed) { continue; }
+
+        const column = rawLine.indexOf(parsed.name);
+        fields.push({
+            name: parsed.name,
+            type: parsed.type,
+            line: i,
+            column: Math.max(column, 0),
+            ownerClassName,
+            hasGetter: accessorConfig.hasGetter,
+            hasSetter: accessorConfig.hasSetter,
+            getterNames: accessorConfig.hasGetter ? buildGetterNames(parsed.name, parsed.type) : [],
+            setterNames: accessorConfig.hasSetter ? buildSetterNames(parsed.name) : []
+        });
+    }
+
+    lombokFieldCache.set(filePath, { version: document.version, fields });
+    return fields;
+}
+
+/** 根据光标位置定位 Lombok 字段 */
+function findFieldAtPosition(document: vscode.TextDocument, position: vscode.Position): JavaFieldInfo | null {
+    const fields = parseLombokFields(document);
+    for (const field of fields) {
+        if (field.line !== position.line) { continue; }
+
+        const start = field.column;
+        const end = start + field.name.length;
+        if (position.character >= start && position.character <= end) {
+            return field;
+        }
+    }
+    return null;
+}
+
+/** 判断当前行是否包含字段直接写入 */
+function containsDirectFieldWrite(lineText: string, fieldName: string): boolean {
+    const escaped = escapeRegex(fieldName);
+    const assignmentPatterns = [
+        new RegExp(`\\b${escaped}\\b\\s*(?:=|\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=|<<=|>>=|>>>=)`),
+        new RegExp(`(?:\\+\\+|--)\\s*\\b${escaped}\\b`),
+        new RegExp(`\\b${escaped}\\b\\s*(?:\\+\\+|--)`)
+    ];
+    return assignmentPatterns.some(pattern => pattern.test(lineText));
+}
+
+/** 判断当前行是否包含字段直接读取 */
+function containsDirectFieldRead(lineText: string, fieldName: string): boolean {
+    const escaped = escapeRegex(fieldName);
+    if (!new RegExp(`\\b${escaped}\\b`).test(lineText)) { return false; }
+    if (containsDirectFieldWrite(lineText, fieldName)) { return false; }
+    return true;
+}
+
+/** 收集文件中看起来是目标类型的变量名，用来降低 getId 这类误报 */
+function collectLikelyReceiverNames(content: string, className: string): Set<string> {
+    const receiverNames = new Set<string>();
+    const escapedClassName = escapeRegex(className);
+    const declarationPatterns = [
+        new RegExp(`\\b${escapedClassName}\\s+([a-zA-Z_]\\w*)\\b`, 'g'),
+        new RegExp(`\\b(?:List|Set|Collection|Iterable|ArrayList|HashSet)\\s*<\\s*${escapedClassName}\\s*>\\s+([a-zA-Z_]\\w*)\\b`, 'g')
+    ];
+
+    for (const pattern of declarationPatterns) {
+        let match: RegExpExecArray | null;
+        while ((match = pattern.exec(content)) !== null) {
+            receiverNames.add(match[1]);
+        }
+    }
+
+    return receiverNames;
+}
+
+/** 判断 getter/setter 调用是否属于目标类实例 */
+function findAccessorCallColumn(rawLine: string, methodName: string, className: string | null, receiverNames: Set<string>): number {
+    const escapedMethodName = escapeRegex(methodName);
+    if (className) {
+        const methodRefPattern = new RegExp(`\\b${escapeRegex(className)}\\s*::\\s*${escapedMethodName}\\b`);
+        const methodRefMatch = methodRefPattern.exec(rawLine);
+        if (methodRefMatch) {
+            const methodCol = rawLine.indexOf(methodName, methodRefMatch.index);
+            if (methodCol >= 0) { return methodCol; }
+        }
+
+        const newInstancePattern = new RegExp(`\\bnew\\s+${escapeRegex(className)}\\s*\\([^)]*\\)\\s*\\.\\s*${escapedMethodName}\\s*\\(`);
+        const newInstanceMatch = newInstancePattern.exec(rawLine);
+        if (newInstanceMatch) {
+            const methodCol = rawLine.indexOf(methodName, newInstanceMatch.index);
+            if (methodCol >= 0) { return methodCol; }
+        }
+    }
+
+    for (const receiverName of receiverNames) {
+        const receiverPattern = new RegExp(`\\b${escapeRegex(receiverName)}\\s*\\.\\s*${escapedMethodName}\\s*\\(`);
+        const receiverMatch = receiverPattern.exec(rawLine);
+        if (!receiverMatch) { continue; }
+
+        const methodCol = rawLine.indexOf(methodName, receiverMatch.index);
+        if (methodCol >= 0) { return methodCol; }
+    }
+
+    return -1;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // CodeLens Provider
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -367,6 +729,20 @@ class JavaCodeLensProvider implements vscode.CodeLensProvider {
                         codeLenses.push(createCodeLens(i, document, 'Jump to Implementation',
                             'java-interface-impl-jumper.jumpToImplementationFromAbstractClass', [filePath, typeName]));
                         break;
+                    }
+                }
+            }
+
+            if (!isIntf) {
+                const lombokFields = parseLombokFields(document);
+                for (const field of lombokFields) {
+                    if (field.hasGetter) {
+                        codeLenses.push(createCodeLens(field.line, document, 'Find Reads',
+                            'java-interface-impl-jumper.findLombokFieldReferences', [document.uri, field.line, field.name, 'read']));
+                    }
+                    if (field.hasSetter) {
+                        codeLenses.push(createCodeLens(field.line, document, 'Find Writes',
+                            'java-interface-impl-jumper.findLombokFieldReferences', [document.uri, field.line, field.name, 'write']));
                     }
                 }
             }
@@ -897,6 +1273,168 @@ async function jumpToInterfaceFromMethod(filePath: string, methodName: string, p
 // ═══════════════════════════════════════════════════════════════════════════════
 
 let outputChannel: vscode.OutputChannel;
+let referenceTreeProvider: ReferenceResultsProvider;
+let activeReferenceDecoration: vscode.TextEditorDecorationType | undefined;
+
+class ReferenceResultsProvider implements vscode.TreeDataProvider<ReferenceTreeNode> {
+    private readonly changeEmitter = new vscode.EventEmitter<ReferenceTreeNode | undefined>();
+    readonly onDidChangeTreeData = this.changeEmitter.event;
+    private root: ReferenceTreeNode = {
+        kind: 'root',
+        label: 'No references found',
+        children: []
+    };
+
+    getTreeItem(element: ReferenceTreeNode): vscode.TreeItem {
+        const collapsibleState = element.children && element.children.length > 0
+            ? vscode.TreeItemCollapsibleState.Expanded
+            : vscode.TreeItemCollapsibleState.None;
+        const label = element.highlightRange
+            ? { label: element.label, highlights: [element.highlightRange] }
+            : element.label;
+        const item = new vscode.TreeItem(label, collapsibleState);
+
+        if (element.kind === 'file') {
+            item.resourceUri = element.location?.uri;
+            item.contextValue = 'referenceFile';
+            item.iconPath = new vscode.ThemeIcon('file-code');
+        }
+
+        if (element.kind === 'reference' && element.location) {
+            item.description = element.accessType ? element.accessType.toUpperCase() : undefined;
+            item.tooltip = element.label;
+            item.iconPath = getReferenceIcon(element.accessType || 'reference');
+            item.command = {
+                title: 'Open Reference',
+                command: 'java-interface-impl-jumper.openReferenceLocation',
+                arguments: [element.location]
+            };
+            item.contextValue = 'referenceLocation';
+        }
+
+        return item;
+    }
+
+    getChildren(element?: ReferenceTreeNode): vscode.ProviderResult<ReferenceTreeNode[]> {
+        if (!element) { return this.root.children || []; }
+        return element.children || [];
+    }
+
+    async setReferences(title: string, references: vscode.Location[]): Promise<void> {
+        this.root = {
+            kind: 'root',
+            label: title,
+            children: await buildReferenceTreeNodes(references)
+        };
+        this.changeEmitter.fire(undefined);
+    }
+}
+
+/** 获取不同引用类型的图标和颜色 */
+function getReferenceIcon(accessType: FieldAccessType | 'reference'): vscode.ThemeIcon {
+    if (accessType === 'read') {
+        return new vscode.ThemeIcon('eye', new vscode.ThemeColor('testing.iconPassed'));
+    }
+    if (accessType === 'write') {
+        return new vscode.ThemeIcon('edit', new vscode.ThemeColor('testing.iconQueued'));
+    }
+    return new vscode.ThemeIcon('references', new vscode.ThemeColor('charts.blue'));
+}
+
+/** 根据引用来源推断展示类型 */
+function inferReferenceAccessType(hitText: string): FieldAccessType | 'reference' {
+    if (/^set[A-Z_]/.test(hitText)) { return 'write'; }
+    if (/^(get|is)[A-Z_]/.test(hitText)) { return 'read'; }
+    return 'reference';
+}
+
+/** 生成引用位置缓存键 */
+function getReferenceAccessTypeCacheKey(location: vscode.Location): string {
+    return `${location.uri.fsPath}:${location.range.start.line}:${location.range.start.character}:${location.range.end.character}`;
+}
+
+/** 构建按文件分组的引用结果树 */
+async function buildReferenceTreeNodes(references: vscode.Location[]): Promise<ReferenceTreeNode[]> {
+    const grouped = new Map<string, vscode.Location[]>();
+    for (const ref of references) {
+        const refs = grouped.get(ref.uri.fsPath) || [];
+        refs.push(ref);
+        grouped.set(ref.uri.fsPath, refs);
+    }
+
+    const fileNodes: ReferenceTreeNode[] = [];
+    for (const [filePath, fileReferences] of [...grouped.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+        const children: ReferenceTreeNode[] = [];
+        const doc = await vscode.workspace.openTextDocument(filePath);
+        const sortedRefs = fileReferences.sort((a, b) => a.range.start.line - b.range.start.line);
+
+        for (const ref of sortedRefs) {
+            const lineText = doc.lineAt(ref.range.start.line).text.trim();
+            const hitText = doc.getText(ref.range);
+            const accessType = referenceAccessTypeCache.get(getReferenceAccessTypeCacheKey(ref)) || inferReferenceAccessType(hitText);
+            const prefix = `${ref.range.start.line + 1}: `;
+            const label = `${prefix}${lineText}`;
+            const hitStart = label.indexOf(hitText, prefix.length);
+            const highlightRange: [number, number] | undefined = hitStart >= 0
+                ? [hitStart, hitStart + hitText.length]
+                : undefined;
+            children.push({
+                kind: 'reference',
+                label,
+                location: ref,
+                accessType,
+                hitText,
+                highlightRange
+            });
+        }
+
+        fileNodes.push({
+            kind: 'file',
+            label: `${path.basename(filePath)} (${children.length})`,
+            location: new vscode.Location(vscode.Uri.file(filePath), new vscode.Position(0, 0)),
+            children
+        });
+    }
+
+    return fileNodes;
+}
+
+/** 在编辑器中打开引用位置 */
+async function openReferenceLocation(location: vscode.Location): Promise<void> {
+    const document = await vscode.workspace.openTextDocument(location.uri);
+    const editor = await vscode.window.showTextDocument(document);
+    editor.selection = new vscode.Selection(location.range.start, location.range.end);
+    if (activeReferenceDecoration) {
+        activeReferenceDecoration.dispose();
+    }
+    activeReferenceDecoration = vscode.window.createTextEditorDecorationType({
+        backgroundColor: new vscode.ThemeColor('editor.findMatchHighlightBackground'),
+        border: '1px solid',
+        borderColor: new vscode.ThemeColor('editor.findMatchBorder')
+    });
+    editor.setDecorations(activeReferenceDecoration, [location.range]);
+    editor.revealRange(location.range, vscode.TextEditorRevealType.InCenter);
+}
+
+/** 复制当前 Java 行的引用 */
+async function copyReference(): Promise<void> {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) {
+        vscode.window.showInformationMessage('No active editor');
+        return;
+    }
+
+    const reference = buildCopyReference(editor.document, editor.selection.active);
+
+    await vscode.env.clipboard.writeText(reference);
+    vscode.window.setStatusBarMessage(`Copied reference: ${reference}`, 3000);
+}
+
+/** 在底部面板展示引用结果 */
+async function showReferencesInPanel(references: vscode.Location[], title: string): Promise<void> {
+    await referenceTreeProvider.setReferences(title, references);
+    await vscode.commands.executeCommand('java-interface-impl-jumper.referenceResults.focus');
+}
 
 /** Find all references to a method across the workspace */
 async function findMethodReferences(docUri: vscode.Uri, lineNumber: number, methodName?: string) {
@@ -924,8 +1462,8 @@ async function findMethodReferences(docUri: vscode.Uri, lineNumber: number, meth
         outputChannel.show(true);
         outputChannel.appendLine(`\nFinding references to ${name}...`);
 
-        const className = getClassNameFromContent(document.getText());
-        const references = await findReferencesManually(name, docUri, className);
+        const ownerNames = getReferenceOwnerNames(document.getText());
+        const references = await findReferencesManually(name, docUri, ownerNames);
 
         outputChannel.appendLine(`Found ${references.length} references to ${name}`);
 
@@ -949,7 +1487,7 @@ async function findMethodReferences(docUri: vscode.Uri, lineNumber: number, meth
             return;
         }
 
-        await showReferencesQuickPick(filtered, name);
+        await showReferencesInPanel(filtered, `${name} (${filtered.length})`);
     } catch (error) {
         log(LogLevel.Error, 'Error in findMethodReferences:', error);
         vscode.window.showErrorMessage(`Error finding references: ${error instanceof Error ? error.message : String(error)}`);
@@ -957,7 +1495,7 @@ async function findMethodReferences(docUri: vscode.Uri, lineNumber: number, meth
 }
 
 /** Manually search for method references across all Java files */
-async function findReferencesManually(methodName: string, originUri: vscode.Uri, className?: string | null): Promise<vscode.Location[]> {
+async function findReferencesManually(methodName: string, originUri: vscode.Uri, ownerNames: string[] = []): Promise<vscode.Location[]> {
     const references: vscode.Location[] = [];
     const seen = new Set<string>();
     const files = await vscode.workspace.findFiles('**/*.java', buildExcludePattern());
@@ -966,12 +1504,10 @@ async function findReferencesManually(methodName: string, originUri: vscode.Uri,
     const BATCH = 20;
     for (let i = 0; i < files.length; i += BATCH) {
         await Promise.all(files.slice(i, i + BATCH).map(async (fileUri) => {
-            if (fileUri.fsPath === originUri.fsPath) { return; }
-
             try {
                 const content = await fs.promises.readFile(fileUri.fsPath, 'utf8');
                 if (!content.includes(methodName)) { return; }
-                if (className && !content.includes(className)) { return; }
+                if (ownerNames.length > 0 && !ownerNames.some(ownerName => content.includes(ownerName))) { return; }
 
                 const lines = content.split('\n');
                 const importEnd = findImportSectionEndLine(lines);
@@ -993,10 +1529,12 @@ async function findReferencesManually(methodName: string, originUri: vscode.Uri,
                     seen.add(key);
 
                     const col = match.index - before.lastIndexOf('\n') - 1;
-                    references.push(new vscode.Location(
+                    const location = new vscode.Location(
                         fileUri,
                         new vscode.Range(lineNum, col, lineNum, col + methodName.length)
-                    ));
+                    );
+                    referenceAccessTypeCache.set(getReferenceAccessTypeCacheKey(location), 'reference');
+                    references.push(location);
                 }
             } catch {}
         }));
@@ -1007,47 +1545,172 @@ async function findReferencesManually(methodName: string, originUri: vscode.Uri,
     return references;
 }
 
-/** Show a QuickPick list of references for user selection */
-async function showReferencesQuickPick(references: vscode.Location[], methodName: string) {
-    const items: vscode.QuickPickItem[] = [];
+/** 在工作区中搜索 Lombok 字段的读写引用 */
+async function findLombokFieldReferencesManually(
+    field: JavaFieldInfo,
+    originUri: vscode.Uri,
+    options: FieldReferenceSearchOptions
+): Promise<vscode.Location[]> {
+    const references: vscode.Location[] = [];
+    const seen = new Set<string>();
+    const files = await vscode.workspace.findFiles('**/*.java', buildExcludePattern());
+    const accessorNames = [
+        ...(options.includeReads ? field.getterNames : []),
+        ...(options.includeWrites ? field.setterNames : [])
+    ];
+    const searchTokens = [field.name, ...accessorNames];
 
-    for (const ref of references) {
-        try {
-            const doc = await vscode.workspace.openTextDocument(ref.uri);
-            const lineText = doc.lineAt(ref.range.start.line).text.trim();
-            const cls = getClassNameFromContent(doc.getText());
-
-            items.push({
-                label: `${path.basename(ref.uri.fsPath)}:${ref.range.start.line + 1}${cls ? ` [${cls}]` : ''}`,
-                description: ref.uri.fsPath,
-                detail: lineText
-            });
-        } catch {
-            items.push({
-                label: `${path.basename(ref.uri.fsPath)}:${ref.range.start.line + 1}`,
-                description: ref.uri.fsPath,
-                detail: '(unable to read)'
-            });
-        }
+    if (options.includeDeclaration) {
+        references.push(new vscode.Location(
+            originUri,
+            new vscode.Range(field.line, field.column, field.line, field.column + field.name.length)
+        ));
     }
 
-    const selected = await vscode.window.showQuickPick(items, {
-        placeHolder: `Select reference to ${methodName} (${references.length} found)`
-    });
+    const BATCH = 20;
+    for (let i = 0; i < files.length; i += BATCH) {
+        await Promise.all(files.slice(i, i + BATCH).map(async (fileUri) => {
+            try {
+                const content = await fs.promises.readFile(fileUri.fsPath, 'utf8');
+                if (!searchTokens.some(token => content.includes(token))) { return; }
+                if (field.ownerClassName && !content.includes(field.ownerClassName) && fileUri.fsPath !== originUri.fsPath) {
+                    return;
+                }
 
-    if (selected && selected.description) {
-        const lineStr = selected.label.split(':')[1]?.split(' ')[0];
-        const lineNum = lineStr ? parseInt(lineStr) - 1 : -1;
-        const selectedRef = references.find(ref =>
-            ref.uri.fsPath === selected.description && ref.range.start.line === lineNum
-        );
+                const lines = content.split('\n');
+                const importEnd = findImportSectionEndLine(lines);
+                const isOriginFile = fileUri.fsPath === originUri.fsPath;
+                const receiverNames = field.ownerClassName
+                    ? collectLikelyReceiverNames(content, field.ownerClassName)
+                    : new Set<string>();
 
-        if (selectedRef) {
-            const doc = await vscode.workspace.openTextDocument(selectedRef.uri);
-            const editor = await vscode.window.showTextDocument(doc);
-            editor.selection = new vscode.Selection(selectedRef.range.start, selectedRef.range.end);
-            editor.revealRange(selectedRef.range, vscode.TextEditorRevealType.InCenter);
+                for (let lineNum = 0; lineNum < lines.length; lineNum++) {
+                    if (lineNum <= importEnd) { continue; }
+                    if (isOriginFile && lineNum === field.line) { continue; }
+
+                    const rawLine = lines[lineNum];
+                    const lineText = stripLine(rawLine).trim();
+                    if (!lineText || lineText.startsWith('import ')) { continue; }
+                    if (lineText.startsWith('//') || lineText.startsWith('*')) { continue; }
+
+                    const matches: { name: string; accessType: FieldAccessType }[] = [];
+
+                    if (isOriginFile && options.includeReads && containsDirectFieldRead(lineText, field.name)) {
+                        matches.push({ name: field.name, accessType: 'read' });
+                    }
+                    if (isOriginFile && options.includeWrites && containsDirectFieldWrite(lineText, field.name)) {
+                        matches.push({ name: field.name, accessType: 'write' });
+                    }
+                    if (options.includeReads) {
+                        for (const getterName of field.getterNames) {
+                            if (isOriginFile && new RegExp(`\\b${escapeRegex(getterName)}\\s*\\(`).test(lineText)) {
+                                matches.push({ name: getterName, accessType: 'read' });
+                                continue;
+                            }
+                            if (findAccessorCallColumn(rawLine, getterName, field.ownerClassName, receiverNames) >= 0) {
+                                matches.push({ name: getterName, accessType: 'read' });
+                            }
+                        }
+                    }
+                    if (options.includeWrites) {
+                        for (const setterName of field.setterNames) {
+                            if (isOriginFile && new RegExp(`\\b${escapeRegex(setterName)}\\s*\\(`).test(lineText)) {
+                                matches.push({ name: setterName, accessType: 'write' });
+                                continue;
+                            }
+                            if (findAccessorCallColumn(rawLine, setterName, field.ownerClassName, receiverNames) >= 0) {
+                                matches.push({ name: setterName, accessType: 'write' });
+                            }
+                        }
+                    }
+
+                    for (const match of matches) {
+                        const accessorCol = match.name === field.name
+                            ? -1
+                            : findAccessorCallColumn(rawLine, match.name, field.ownerClassName, receiverNames);
+                        const col = accessorCol >= 0 ? accessorCol : rawLine.indexOf(match.name);
+                        if (col < 0) { continue; }
+
+                        const key = `${fileUri.fsPath}:${lineNum}:${col}:${match.accessType}`;
+                        if (seen.has(key)) { continue; }
+                        seen.add(key);
+
+                        const location = new vscode.Location(
+                            fileUri,
+                            new vscode.Range(lineNum, col, lineNum, col + match.name.length)
+                        );
+                        referenceAccessTypeCache.set(getReferenceAccessTypeCacheKey(location), match.accessType);
+                        references.push(location);
+                    }
+                }
+            } catch {}
+        }));
+
+        if (references.length > 500) { break; }
+    }
+
+    return references;
+}
+
+/** 查找 Lombok 字段的读取或写入引用 */
+async function findLombokFieldReferences(docUri: vscode.Uri, lineNumber: number, fieldName: string, accessType: FieldAccessType) {
+    try {
+        const document = await vscode.workspace.openTextDocument(docUri);
+        const field = parseLombokFields(document).find(item => item.line === lineNumber && item.name === fieldName);
+        if (!field) {
+            vscode.window.showInformationMessage(`Could not determine Lombok field ${fieldName}`);
+            return;
         }
+
+        outputChannel.show(true);
+        outputChannel.appendLine(`\nFinding ${accessType}s for Lombok field ${field.name}...`);
+
+        const references = await findLombokFieldReferencesManually(field, docUri, {
+            includeReads: accessType === 'read',
+            includeWrites: accessType === 'write',
+            includeDeclaration: false
+        });
+
+        outputChannel.appendLine(`Found ${references.length} ${accessType} references to ${field.name}`);
+
+        if (references.length === 0) {
+            vscode.window.showInformationMessage(`No ${accessType} references found for Lombok field ${field.name}`);
+            return;
+        }
+
+        if (references.length === 1) {
+            const ref = references[0];
+            const refDoc = await vscode.workspace.openTextDocument(ref.uri);
+            const editor = await vscode.window.showTextDocument(refDoc);
+            editor.selection = new vscode.Selection(ref.range.start, ref.range.end);
+            editor.revealRange(ref.range, vscode.TextEditorRevealType.InCenter);
+            return;
+        }
+
+        await showReferencesInPanel(references, `${field.name} ${accessType} (${references.length})`);
+    } catch (error) {
+        log(LogLevel.Error, 'Error in findLombokFieldReferences:', error);
+        vscode.window.showErrorMessage(`Error finding Lombok field references: ${error instanceof Error ? error.message : String(error)}`);
+    }
+}
+
+class LombokFieldReferenceProvider implements vscode.ReferenceProvider {
+    async provideReferences(
+        document: vscode.TextDocument,
+        position: vscode.Position,
+        context: vscode.ReferenceContext,
+        token: vscode.CancellationToken
+    ): Promise<vscode.Location[]> {
+        if (token.isCancellationRequested) { return []; }
+
+        const field = findFieldAtPosition(document, position);
+        if (!field) { return []; }
+
+        return findLombokFieldReferencesManually(field, document.uri, {
+            includeReads: field.hasGetter,
+            includeWrites: field.hasSetter,
+            includeDeclaration: context.includeDeclaration
+        });
     }
 }
 
@@ -1069,6 +1732,12 @@ export function activate(context: vscode.ExtensionContext) {
     // Output channel (created once, reused)
     outputChannel = vscode.window.createOutputChannel('Java Interface Impl Jumper');
     context.subscriptions.push(outputChannel);
+
+    // 注册固定引用结果面板
+    referenceTreeProvider = new ReferenceResultsProvider();
+    context.subscriptions.push(
+        vscode.window.registerTreeDataProvider('java-interface-impl-jumper.referenceResults', referenceTreeProvider)
+    );
 
     // Watch configuration changes
     context.subscriptions.push(
@@ -1095,11 +1764,22 @@ export function activate(context: vscode.ExtensionContext) {
         )
     );
 
+    // 注册 Lombok 字段引用查询能力
+    context.subscriptions.push(
+        vscode.languages.registerReferenceProvider(
+            { language: 'java', scheme: 'file' },
+            new LombokFieldReferenceProvider()
+        )
+    );
+
     // Register commands
     context.subscriptions.push(
         vscode.commands.registerCommand('java-interface-impl-jumper.jumpToImplementationFromMethod', jumpToImplementationFromMethod),
         vscode.commands.registerCommand('java-interface-impl-jumper.jumpToInterfaceFromMethod', jumpToInterfaceFromMethod),
         vscode.commands.registerCommand('java-interface-impl-jumper.findMethodReferences', findMethodReferences),
+        vscode.commands.registerCommand('java-interface-impl-jumper.findLombokFieldReferences', findLombokFieldReferences),
+        vscode.commands.registerCommand('java-interface-impl-jumper.openReferenceLocation', openReferenceLocation),
+        vscode.commands.registerCommand('java-interface-impl-jumper.copyReference', copyReference),
         vscode.commands.registerCommand('java-interface-impl-jumper.jumpToImplementationFromAbstractClass', jumpToImplementationFromAbstractClass),
         vscode.commands.registerCommand('java-interface-impl-jumper.jumpToImplementationFromInterface', jumpToImplementationFromInterface)
     );
@@ -1119,6 +1799,10 @@ export function deactivate() {
     if (cacheCleanupInterval) {
         clearInterval(cacheCleanupInterval);
         cacheCleanupInterval = undefined;
+    }
+    if (activeReferenceDecoration) {
+        activeReferenceDecoration.dispose();
+        activeReferenceDecoration = undefined;
     }
     clearAllCaches();
 }
